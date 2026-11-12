@@ -26,7 +26,22 @@ export function deploymentResourceNames(workerName) {
   };
 }
 
-export function buildForkWrangler(source, { workerName, databaseId, migrationsDir, release }) {
+const SCRIPT_NAME_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+
+/**
+ * Nome do script Worker publicado. Por padrão é o próprio id da instalação.
+ * SMARTZAP_WORKER_NAME cobre instalações cujo Worker foi renomeado no painel
+ * (ex.: smartzap-cloudflare): os recursos continuam com o prefixo do id, só o
+ * script muda. Staging nunca usa o override.
+ */
+export function resolveScriptName(override, workerName, staging = false) {
+  const value = String(override || "").trim().toLowerCase();
+  if (!value || staging) return workerName;
+  if (!SCRIPT_NAME_PATTERN.test(value)) throw new Error("SMARTZAP_WORKER_NAME inválido: use letras minúsculas, números e hífens.");
+  return value;
+}
+
+export function buildForkWrangler(source, { workerName, databaseId, migrationsDir, release, scriptName }) {
   const parsed = JSON.parse(stripJsonComments(source));
   const names = deploymentResourceNames(workerName);
   parsed.name = workerName;
@@ -59,7 +74,12 @@ export function buildForkWrangler(source, { workerName, databaseId, migrationsDi
     SMARTZAP_SCHEMA_VERSION: release.schemaVersion,
     SMARTZAP_RELEASE_CHANNEL: release.channel,
   };
-  return prepareIsolatedDeploymentConfig(`${JSON.stringify(parsed, null, 2)}\n`).source;
+  const prepared = prepareIsolatedDeploymentConfig(`${JSON.stringify(parsed, null, 2)}\n`).source;
+  if (!scriptName || scriptName === workerName) return prepared;
+  // Workflows, gateway e rate limit já foram derivados do id; só o script muda.
+  const renamed = JSON.parse(prepared);
+  renamed.name = scriptName;
+  return `${JSON.stringify(renamed, null, 2)}\n`;
 }
 
 export function parseD1Databases(output) {

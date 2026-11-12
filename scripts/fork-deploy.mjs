@@ -11,6 +11,7 @@ import {
   deploymentResourceNames,
   parseD1Databases,
   parseQueueNames,
+  resolveScriptName,
 } from "./lib/fork-bootstrap.mjs";
 import { buildRollbackCheckpoint, parseActiveDeploymentVersion, parseTimeTravelBookmark } from "./lib/fork-release.mjs";
 import { assertSchemaTransition, validateForkMigrationManifest } from "./lib/fork-migrations.mjs";
@@ -22,6 +23,7 @@ const staging = process.argv.includes("--staging");
 const baseInstallId = assertSecretInputs(process.env);
 const workerName = deploymentId(baseInstallId, staging);
 const names = deploymentResourceNames(workerName);
+const scriptName = resolveScriptName(process.env.SMARTZAP_WORKER_NAME, workerName, staging);
 const packageJson = JSON.parse(readFileSync(resolve(root, "package.json"), "utf8"));
 const migrationManifest = validateForkMigrationManifest(root);
 const version = String(packageJson.version || "0.0.0");
@@ -146,7 +148,7 @@ function captureRollbackCheckpoint(d1Created) {
   };
   if (current.version === version && current.commit === commit && String(current.schemaVersion) === schemaVersion) return null;
   const bookmark = parseTimeTravelBookmark(runWrangler(["d1", "time-travel", "info", names.database, "--json"]));
-  const versionId = parseActiveDeploymentVersion(runWrangler(["deployments", "list", "--name", workerName, "--json"]));
+  const versionId = parseActiveDeploymentVersion(runWrangler(["deployments", "list", "--name", scriptName, "--json"]));
   const checkpoint = buildRollbackCheckpoint({ workerName, databaseName: names.database, bookmark, versionId, fromRelease: current, toRelease: release });
   mkdirSync(checkpointsDirectory, { recursive: true });
   const checkpointPath = join(checkpointsDirectory, `${workerName}-${Date.now()}.json`);
@@ -210,14 +212,14 @@ try {
   const d1 = ensureD1();
   const template = readFileSync(resolve(root, "wrangler.jsonc"), "utf8");
   writeMigrationSet();
-  writeFileSync(configPath, buildForkWrangler(template, { workerName, databaseId: d1.id, migrationsDir: `.smartzap/migrations/${workerName}`, release }));
+  writeFileSync(configPath, buildForkWrangler(template, { workerName, databaseId: d1.id, migrationsDir: `.smartzap/migrations/${workerName}`, release, scriptName }));
   assertOrPrepareDatabase(d1.created);
   ensureR2AndQueues(inventory);
   captureRollbackCheckpoint(d1.created);
   applyMigrations();
   deploy();
   confirmScheduledTrigger();
-  console.log(`SmartZap ${version} publicado como ${workerName}. Abra a URL do Worker e conclua /setup.`);
+  console.log(`SmartZap ${version} publicado como ${scriptName}. Abra a URL do Worker e conclua /setup.`);
 } catch (error) {
   console.error(`Instalação interrompida com segurança: ${error instanceof Error ? error.message : String(error)}`);
   console.error("Os recursos já criados foram preservados para retomada com o mesmo SMARTZAP_INSTALL_ID.");
