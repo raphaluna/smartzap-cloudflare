@@ -5,7 +5,7 @@ import { contactsDb } from "../db/contacts";
 import { settingsDb } from "../db/settings";
 import { templatesDb } from "../db/templates";
 import { broadcastToHub } from "../api/realtime";
-import type { MetaWebhookEvent } from "../api/webhook";
+import type { CoexCustomer, MetaWebhookEvent } from "../api/webhook";
 import { sanitizeMetaDetail } from "../whatsapp/client";
 import { conversationsDb } from "../db/conversations";
 import { conversionsDb } from "../db/conversions";
@@ -78,6 +78,36 @@ async function persistInboundMedia(
       checksum,
     )
     .run();
+}
+
+async function handOffToHumanAfterEcho(env: Env, conversationId: string) {
+  const row = await env.DB.prepare("SELECT mode FROM conversations WHERE id = ?1")
+    .bind(conversationId)
+    .first<{ mode: string }>();
+  if (row?.mode !== "bot") return;
+  const hours = Number(
+    (await settingsDb(env.DB).get("inbox_human_mode_timeout_hours")) ?? 0,
+  );
+  await conversationsDb(env.DB).setOperation(conversationId, {
+    mode: "human",
+    handoffReason: "Respondido pelo app WhatsApp Business no celular",
+    humanModeExpiresAt:
+      Number.isInteger(hours) && hours > 0
+        ? Math.floor(Date.now() / 1000) + hours * 3600
+        : null,
+  });
+}
+
+async function ensureCoexContact(env: Env, customer: CoexCustomer) {
+  const phone = customer.phone ? normalizePhone(`+${customer.phone}`) : null;
+  if (!phone && !customer.userId) return null;
+  return contactsDb(env.DB).ensureInboundContact({
+    ...(phone ? { phone } : {}),
+    waId: customer.phone,
+    userId: customer.userId,
+    parentUserId: customer.parentUserId,
+    username: customer.username,
+  });
 }
 
 async function persistFlowSubmission(
@@ -296,6 +326,42 @@ async function recordFor(event: MetaWebhookEvent): Promise<WebhookEventRecord> {
           ? [{ code: error.code, detail: error.detail }]
           : undefined,
       }),
+    };
+  }
+  if (event.kind === "coex_message") {
+    return {
+      event_kind: "coex_message",
+      event_key: await sha256(
+        [event.wabaId, event.phoneNumberId, event.message.id, event.source].join(":"),
+      ),
+      waba_id: event.wabaId,
+      phone_number_id: event.phoneNumberId,
+      message_id: event.message.id,
+      status: `coex_${event.source}`,
+      // Sem texto nem identidade: só o necessário para auditar a sincronização.
+      raw: JSON.stringify({
+        type: event.message.type,
+        timestamp: event.message.timestamp,
+        direction: event.direction,
+      }),
+    };
+  }
+  if (event.kind === "coex_contact") {
+    return {
+      event_kind: "coex_contact",
+      event_key: await sha256(
+        [
+          event.wabaId,
+          event.action,
+          event.customer.userId ?? event.customer.phone ?? "",
+          String(event.timestamp),
+        ].join(":"),
+      ),
+      waba_id: event.wabaId,
+      phone_number_id: event.phoneNumberId,
+      message_id: null,
+      status: `coex_contact_${event.action}`,
+      raw: JSON.stringify({ action: event.action, timestamp: event.timestamp }),
     };
   }
   if (event.kind === "inbound_message") {
@@ -609,6 +675,72 @@ export async function handleWebhookBatch(
         }
       }
       await statusInbox.markIgnored(eventRecord.event_key);
+      continue;
+    }
+    if (event.kind === "coex_contact") {
+      // Remoção da agenda do celular não apaga o contato do CRM.
+      if (event.action === "add") {
+        const contact = await ensureCoexContact(env, event.customer);
+        if (contact && event.fullName)
+          await contactsDb(env.DB).applyAddressBookName(contact.id, event.fullName);
+        if (contact) contactsChanged = true;
+      }
+      continue;
+    }
+    if (event.kind === "coex_message") {
+      const input = {
+        id: event.message.id,
+        phoneNumberId: event.phoneNumberId,
+        messageType: event.message.type,
+        textBody: event.message.textBody,
+        content: event.message.content,
+        timestamp: Number(event.message.timestamp),
+      };
+      const contact = event.customer
+        ? await ensureCoexContact(env, event.customer)
+        : null;
+      let conversationId: string | null;
+      if (contact) {
+        contactsChanged = true;
+        // Histórico e ecos nunca contam como não lidos nem disparam automação:
+        // são passado, ou foram escritos pela própria empresa no celular.
+        const ingested = await conversationsDb(env.DB).ingestMessage(contact, input, {
+          direction: event.direction,
+          countUnread: false,
+        });
+        conversationId = ingested.conversationId;
+        // Alguém respondeu pelo celular: o robô sai da conversa, como quando um
+        // atendente assume pela inbox. Eco antigo (reentrega) não mexe em nada.
+        if (
+          event.source === "echo" &&
+          ingested.inserted &&
+          input.timestamp > Math.floor(Date.now() / 1000) - 3600
+        )
+          await handOffToHumanAfterEcho(env, conversationId);
+      } else {
+        // Mídia da empresa no histórico chega sem destinatário: só completa o
+        // placeholder já gravado com o mesmo id.
+        conversationId = await conversationsDb(env.DB).completePlaceholder(input);
+      }
+      if (!conversationId) continue;
+      changedConversations.add(conversationId);
+      if (
+        ["image", "video", "audio", "document", "sticker"].includes(event.message.type) &&
+        typeof event.message.content?.mediaId === "string"
+      ) {
+        try {
+          await persistInboundMedia(env, conversationId, event.message.id, event.message.content);
+        } catch (error) {
+          // No histórico a mídia antiga pode já ter expirado na Meta. Repetir o
+          // evento não traz o arquivo de volta, então a mensagem fica sem anexo.
+          if (event.source === "echo") throw error;
+          console.warn(JSON.stringify({
+            level: "warn",
+            msg: "Mídia do histórico indisponível; mensagem mantida sem anexo",
+            error: error instanceof Error ? error.message.slice(0, 200) : "erro",
+          }));
+        }
+      }
       continue;
     }
     if (event.kind === "inbound_message") {

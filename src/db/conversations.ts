@@ -39,11 +39,41 @@ export type AiDraft = {
   send_failed_at?: string | null;
 };
 
+function serializeContent(content?: Record<string, unknown>): string | null {
+  const serialized =
+    content && Object.keys(content).length ? JSON.stringify(content) : null;
+  return serialized && serialized.length <= 8192
+    ? serialized
+    : serialized
+      ? JSON.stringify({ truncated: true })
+      : null;
+}
+
 export function conversationsDb(db: D1Database) {
   return {
     async ingestInbound(
       contact: Contact,
       input: InboundMessageInput,
+    ): Promise<{
+      conversationId: string;
+      inserted: boolean;
+    }> {
+      return this.ingestMessage(contact, input, {
+        direction: "inbound",
+        countUnread: true,
+      });
+    },
+
+    /**
+     * Grava uma mensagem na conversa do contato, nos dois sentidos. Usado pelo
+     * inbound comum e pela coexistência (histórico e ecos do app do celular),
+     * que não contam como não lidas. Idempotente pelo id da Meta; um
+     * media_placeholder do histórico é completado quando a mídia chega depois.
+     */
+    async ingestMessage(
+      contact: Contact,
+      input: InboundMessageInput,
+      opts: { direction: "inbound" | "outbound"; countUnread: boolean },
     ): Promise<{
       conversationId: string;
       inserted: boolean;
@@ -74,22 +104,13 @@ export function conversationsDb(db: D1Database) {
       if (!conversation)
         throw new Error("não foi possível materializar a conversa inbound");
 
-      const serialized =
-        input.content && Object.keys(input.content).length
-          ? JSON.stringify(input.content)
-          : null;
-      const contentJson =
-        serialized && serialized.length <= 8192
-          ? serialized
-          : serialized
-            ? JSON.stringify({ truncated: true })
-            : null;
+      const contentJson = serializeContent(input.content);
       const result = await db
         .prepare(
           `INSERT OR IGNORE INTO conversation_messages
            (id, conversation_id, contact_id, direction, message_type, text_body,
             content_json, phone_number_id, meta_timestamp)
-         VALUES (?1, ?2, ?3, 'inbound', ?4, ?5, ?6, ?7, ?8)`,
+         VALUES (?1, ?2, ?3, ?9, ?4, ?5, ?6, ?7, ?8)`,
         )
         .bind(
           input.id,
@@ -100,9 +121,13 @@ export function conversationsDb(db: D1Database) {
           contentJson,
           input.phoneNumberId,
           input.timestamp,
+          opts.direction,
         )
         .run();
       const inserted = result.meta.changes === 1;
+      // Já existia: pode ser o media_placeholder do histórico esperando a mídia.
+      if (!inserted && input.messageType !== "media_placeholder")
+        await this.completePlaceholder(input);
       if (inserted) {
         const preview = (
           input.textBody?.trim() || `[${input.messageType}]`
@@ -116,13 +141,33 @@ export function conversationsDb(db: D1Database) {
              last_message_at = CASE
                WHEN last_message_at IS NULL OR last_message_at <= ?2 THEN ?2
                ELSE last_message_at END,
-             unread_count = unread_count + 1, updated_at = datetime('now')
+             unread_count = unread_count + ?4, updated_at = datetime('now')
            WHERE id = ?1`,
           )
-          .bind(conversation.id, input.timestamp, preview)
+          .bind(conversation.id, input.timestamp, preview, opts.countUnread ? 1 : 0)
           .run();
       }
       return { conversationId: conversation.id, inserted };
+    },
+
+    /** Completa um media_placeholder sem saber o cliente (mídia da empresa no histórico). */
+    async completePlaceholder(input: InboundMessageInput): Promise<string | null> {
+      const row = await db
+        .prepare(
+          `UPDATE conversation_messages SET message_type = ?2,
+             text_body = COALESCE(?3, text_body),
+             content_json = COALESCE(?4, content_json)
+           WHERE id = ?1 AND message_type = 'media_placeholder'
+           RETURNING conversation_id`,
+        )
+        .bind(
+          input.id,
+          input.messageType,
+          input.textBody?.slice(0, 4096) ?? null,
+          serializeContent(input.content),
+        )
+        .first<{ conversation_id: string }>();
+      return row?.conversation_id ?? null;
     },
 
     async list(opts: {

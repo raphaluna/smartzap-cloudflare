@@ -226,6 +226,22 @@ export function contactsDb(db: D1Database) {
       }
       return count;
     },
+    /**
+     * Nome salvo na agenda do app WhatsApp Business (coexistência). É o rótulo
+     * que a própria empresa deu ao contato, então prevalece sobre o nome de
+     * perfil do WhatsApp.
+     */
+    async applyAddressBookName(contactId: string, name: string): Promise<void> {
+      const trimmed = name.trim().slice(0, 256);
+      if (!trimmed) return;
+      await db
+        .prepare(
+          "UPDATE contacts SET name = ?2, updated_at = datetime('now') WHERE id = ?1 AND (name IS NULL OR name <> ?2)",
+        )
+        .bind(contactId, trimmed)
+        .run();
+    },
+
     async ensureInboundContact(input: {
       phone?: string;
       waId?: string;
