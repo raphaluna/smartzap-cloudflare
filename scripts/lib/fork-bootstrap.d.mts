@@ -1,3 +1,4 @@
+export function resolveScriptName(override: string | undefined, workerName: string, staging?: boolean): string;
 export const BASE_INSTALL_ID_PATTERN: RegExp;
 export const DEPLOYMENT_ID_PATTERN: RegExp;
 
@@ -20,6 +21,7 @@ export function buildForkWrangler(source: string, input: {
   databaseId: string;
   migrationsDir: string;
   release: { version: string; commit: string; schemaVersion: string | number; channel: string };
+  scriptName?: string;
 }): string;
 export function parseD1Databases(output: string): Array<{ id: string; name: string }>;
 export function parseCreatedD1Id(output: string): string;
