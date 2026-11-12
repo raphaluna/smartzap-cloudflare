@@ -329,7 +329,92 @@ function extractInboundMessage(
   }
 }
 
+/** Cliente de uma conversa de coexistência (histórico, eco ou agenda do app). */
+export type CoexCustomer = {
+  phone?: string
+  userId?: string
+  parentUserId?: string
+  username?: string
+}
+
+/** Conteúdo normalizado de uma mensagem de coexistência, sem identidade. */
+export type CoexMessage = {
+  id: string
+  timestamp: string
+  type: string
+  textBody?: string
+  content?: Record<string, unknown>
+  deliveryStatus?: string
+}
+
+const COEX_MAX_TEXT = 4096
+// Limite próprio para coexistência: um chunk de histórico pode trazer milhares
+// de mensagens num envelope de até 3 MB, e rejeitar o lote perderia o histórico,
+// que a Meta só sincroniza uma vez.
+const MAX_COEX_EVENTS_PER_REQUEST = 20_000
+
+function digitsOnly(value: unknown): string | undefined {
+  return typeof value === 'string' && /^\d{5,32}$/.test(value) ? value : undefined
+}
+
+function idString(value: unknown, max = 128): string | undefined {
+  return typeof value === 'string' && value.length >= 1 && value.length <= max ? value : undefined
+}
+
+function coexCustomer(input: {
+  phone?: unknown; userId?: unknown; parentUserId?: unknown; username?: unknown
+}): CoexCustomer | undefined {
+  const customer: CoexCustomer = {}
+  const phone = digitsOnly(input.phone)
+  const userId = idString(input.userId)
+  const parentUserId = idString(input.parentUserId)
+  const username = idString(input.username, 256)
+  if (phone) customer.phone = phone
+  if (userId) customer.userId = userId
+  if (parentUserId) customer.parentUserId = parentUserId
+  if (username) customer.username = username
+  return customer.phone || customer.userId ? customer : undefined
+}
+
+/**
+ * Extrai o conteúdo de uma mensagem de histórico/eco reaproveitando o parser de
+ * inbound. Diferente do inbound comum, nunca rejeita o lote: tipo desconhecido
+ * (media_placeholder, unsupported, etc.) vira mensagem sem conteúdo, e só uma
+ * mensagem sem id/timestamp válidos é descartada.
+ */
+function extractCoexMessage(
+  value: Record<string, unknown>, candidate: unknown,
+): CoexMessage | null {
+  if (!candidate || typeof candidate !== 'object') return null
+  const item = candidate as Record<string, unknown>
+  const id = idString(item.id, 512)
+  const timestamp = typeof item.timestamp === 'string' && /^\d{1,16}$/.test(item.timestamp)
+    ? item.timestamp
+    : typeof item.timestamp === 'number' && Number.isSafeInteger(item.timestamp) && item.timestamp >= 0
+      ? String(item.timestamp) : undefined
+  const type = typeof item.type === 'string' && item.type.length >= 1 && item.type.length <= 64
+    ? item.type.toLowerCase() : 'unknown'
+  if (!id || !timestamp) return null
+  // O parser de inbound exige um remetente; a identidade real vem de fora.
+  const parsed = extractInboundMessage(
+    { ...value, contacts: undefined },
+    { ...item, from: '00000', from_user_id: undefined, timestamp, type },
+  )
+  const history = item.history_context && typeof item.history_context === 'object'
+    ? item.history_context as Record<string, unknown> : null
+  const deliveryStatus = idString(history?.status, 32)
+  const textBody = parsed?.textBody?.slice(0, COEX_MAX_TEXT)
+  return {
+    id, timestamp, type,
+    ...(textBody ? { textBody } : {}),
+    ...(parsed?.content ? { content: parsed.content } : {}),
+    ...(deliveryStatus ? { deliveryStatus } : {}),
+  }
+}
+
 export type MetaWebhookEvent =
+  | { kind: 'coex_message'; wabaId: string; phoneNumberId: string; source: 'history' | 'echo'; direction: 'inbound' | 'outbound'; customer?: CoexCustomer; message: CoexMessage }
+  | { kind: 'coex_contact'; wabaId: string; phoneNumberId: string; action: 'add' | 'remove'; customer: CoexCustomer; fullName?: string; firstName?: string; timestamp: number }
   | { kind: 'status'; wabaId: string; phoneNumberId: string; status: MetaStatus }
   | { kind: 'inbound_message'; wabaId: string; phoneNumberId: string; message: MetaInboundMessage }
   | { kind: 'user_preference'; wabaId: string; phoneNumberId: string; preference: z.infer<typeof UserPreferenceSchema> }
@@ -340,6 +425,198 @@ export type MetaWebhookEvent =
 type MetaWebhook = {
   object?: unknown
   entry?: { id?: unknown; time?: unknown; changes?: { field?: unknown; value?: unknown }[] }[]
+}
+
+function arrayOf(value: unknown, max: number): unknown[] {
+  return Array.isArray(value) ? value.slice(0, max) : []
+}
+
+function objectOf(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown> : null
+}
+
+/**
+ * Webhooks da coexistência (app WhatsApp Business + Cloud API no mesmo número):
+ * - history: histórico de até 180 dias, em chunks, sincronizado uma única vez;
+ * - smb_message_echoes: o que a empresa enviou pelo app do celular;
+ * - smb_app_state_sync: agenda de contatos do app.
+ * Nunca rejeita o lote por uma mensagem estranha: perder um chunk de histórico
+ * é irreversível, então o item ruim é descartado e o resto segue.
+ */
+const COEX_FIELDS = new Set(['history', 'smb_message_echoes', 'smb_app_state_sync'])
+
+/**
+ * Grava o corpo bruto de webhooks de coexistência em `coex-raw/AAAA-MM-DD/<field>/<sha256>.json`.
+ * Idempotente pelo hash (reentrega da Meta sobrescreve o mesmo objeto). Falha
+ * no R2 só gera log: nunca bloqueia o processamento normal.
+ */
+export async function archiveCoexPayload(
+  env: Pick<Env, 'MEDIA'>, payload: MetaWebhook, source: Uint8Array,
+): Promise<string | null> {
+  let field = ''
+  for (const entry of Array.isArray(payload.entry) ? payload.entry : []) {
+    for (const change of Array.isArray(entry?.changes) ? entry.changes : []) {
+      if (typeof change?.field === 'string' && COEX_FIELDS.has(change.field)) {
+        field = change.field
+        break
+      }
+    }
+    if (field) break
+  }
+  if (!field) return null
+  const bytes = new Uint8Array(source)
+  try {
+    const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))
+    const hash = Array.from(digest, (b) => b.toString(16).padStart(2, '0')).join('')
+    const day = new Date().toISOString().slice(0, 10)
+    const key = `coex-raw/${day}/${field}/${hash}.json`
+    await env.MEDIA.put(key, bytes, { httpMetadata: { contentType: 'application/json' } })
+    return key
+  } catch (error) {
+    console.warn(JSON.stringify({
+      event: 'coex_raw_archive_failed', field,
+      error: error instanceof Error ? error.message : String(error),
+    }))
+    return null
+  }
+}
+
+export function parseCoexChange(
+  field: string,
+  value: Record<string, unknown>,
+  wabaId: string,
+  phoneNumberId: string,
+  entryTimestamp: number,
+): MetaWebhookEvent[] {
+  const events: MetaWebhookEvent[] = []
+  const metadata = objectOf(value.metadata)
+  const businessPhone = digitsOnly(metadata?.display_phone_number)
+
+  if (field === 'smb_app_state_sync') {
+    for (const raw of arrayOf(value.state_sync, MAX_COEX_EVENTS_PER_REQUEST)) {
+      const item = objectOf(raw)
+      const contact = objectOf(item?.contact)
+      if (!item || !contact || item.type !== 'contact') continue
+      if (item.action !== 'add' && item.action !== 'remove') continue
+      const customer = coexCustomer({
+        phone: contact.phone_number, userId: contact.user_id,
+        parentUserId: contact.parent_user_id, username: contact.username,
+      })
+      if (!customer) continue
+      const ts = Number(objectOf(item.metadata)?.timestamp)
+      const fullName = boundedString(contact.full_name, 256)?.trim()
+      const firstName = boundedString(contact.first_name, 256)?.trim()
+      events.push({
+        kind: 'coex_contact', wabaId, phoneNumberId, action: item.action, customer,
+        ...(fullName ? { fullName } : {}),
+        ...(firstName ? { firstName } : {}),
+        timestamp: Number.isSafeInteger(ts) && ts >= 0 ? ts : entryTimestamp,
+      })
+    }
+    return events
+  }
+
+  if (field === 'smb_message_echoes') {
+    const contacts = arrayOf(value.contacts, 100).map(objectOf).filter(Boolean) as Record<string, unknown>[]
+    for (const raw of arrayOf(value.message_echoes, MAX_COEX_EVENTS_PER_REQUEST)) {
+      const item = objectOf(raw)
+      if (!item) continue
+      const match = contacts.find((contact) =>
+        (item.to_user_id && contact.user_id === item.to_user_id)
+        || (item.to && contact.wa_id === item.to))
+      const customer = coexCustomer({
+        phone: item.to, userId: item.to_user_id ?? match?.user_id,
+        parentUserId: item.to_parent_user_id ?? match?.parent_user_id,
+        username: objectOf(match?.profile)?.username,
+      })
+      const message = extractCoexMessage(value, item)
+      if (!message) continue
+      events.push({
+        kind: 'coex_message', wabaId, phoneNumberId, source: 'echo', direction: 'outbound',
+        ...(customer ? { customer } : {}), message,
+      })
+    }
+    return events
+  }
+
+  // history
+  const pushHistoryMessage = (raw: unknown, threadCustomer?: CoexCustomer) => {
+    const item = objectOf(raw)
+    if (!item) return
+    const message = extractCoexMessage(value, item)
+    if (!message) return
+    const from = digitsOnly(item.from)
+    const sentByUser = typeof item.from_user_id === 'string'
+      || (from !== undefined && from !== businessPhone
+        && (!threadCustomer?.phone || from === threadCustomer.phone))
+    const customer = threadCustomer ?? (sentByUser
+      ? coexCustomer({ phone: from, userId: item.from_user_id, parentUserId: item.from_parent_user_id })
+      : undefined)
+    events.push({
+      kind: 'coex_message', wabaId, phoneNumberId, source: 'history',
+      direction: sentByUser ? 'inbound' : 'outbound',
+      ...(customer ? { customer } : {}), message,
+    })
+  }
+
+  for (const rawChunk of arrayOf(value.history, 1000)) {
+    const chunk = objectOf(rawChunk)
+    if (!chunk) continue
+    for (const candidate of arrayOf(chunk.errors, MAX_ERRORS_PER_CONTAINER)) {
+      const parsed = MetaErrorSchema.safeParse(candidate)
+      if (parsed.success) events.push({
+        kind: 'platform_error', wabaId, phoneNumberId, scope: 'history.errors', error: parsed.data,
+      })
+    }
+    const chunkMeta = objectOf(chunk.metadata)
+    if (chunkMeta) {
+      const summary: Record<string, string | number | boolean | null> = { phone_number_id: phoneNumberId }
+      for (const key of ['phase', 'chunk_order', 'progress']) {
+        const item = chunkMeta[key]
+        if (typeof item === 'number' || typeof item === 'string') summary[key] = item
+      }
+      events.push({ kind: 'platform_event', wabaId, field: 'history', summary })
+    }
+    for (const rawThread of arrayOf(chunk.threads, MAX_COEX_EVENTS_PER_REQUEST)) {
+      const thread = objectOf(rawThread)
+      if (!thread) continue
+      const context = objectOf(thread.context)
+      const customer = coexCustomer({
+        phone: context?.wa_id ?? thread.id, userId: context?.user_id,
+        parentUserId: context?.parent_user_id,
+      })
+      for (const message of arrayOf(thread.messages, MAX_COEX_EVENTS_PER_REQUEST))
+        pushHistoryMessage(message, customer)
+    }
+  }
+  // Mídia do histórico pode chegar fora dos threads, no formato de messages[].
+  for (const message of arrayOf(value.messages, MAX_COEX_EVENTS_PER_REQUEST))
+    pushHistoryMessage(message)
+  return events
+}
+
+// Limites da Queue: 100 mensagens e 256 KB por sendBatch.
+const QUEUE_BATCH_MAX_ITEMS = 100
+const QUEUE_BATCH_MAX_BYTES = 200_000
+
+export function queueBatches(events: MetaWebhookEvent[]): MetaWebhookEvent[][] {
+  const encoder = new TextEncoder()
+  const batches: MetaWebhookEvent[][] = []
+  let current: MetaWebhookEvent[] = []
+  let bytes = 0
+  for (const event of events) {
+    const size = encoder.encode(JSON.stringify(event)).byteLength
+    if (current.length && (current.length >= QUEUE_BATCH_MAX_ITEMS || bytes + size > QUEUE_BATCH_MAX_BYTES)) {
+      batches.push(current)
+      current = []
+      bytes = 0
+    }
+    current.push(event)
+    bytes += size
+  }
+  if (current.length) batches.push(current)
+  return batches
 }
 
 export const webhookRoutes = new Hono<{ Bindings: Env }>()
@@ -375,6 +652,11 @@ export const webhookRoutes = new Hono<{ Bindings: Env }>()
       return c.json({ error: 'envelope Meta inválido' }, 400)
     if (payload.entry.length > MAX_ENVELOPE_ENTRIES)
       return c.json({ error: 'lote Meta excede o limite permitido' }, 400)
+
+    // Coexistência: a sincronização de histórico roda uma vez só. Guarda o corpo
+    // bruto assinado no R2 antes de interpretar, para poder reprocessar se o
+    // formato real divergir do documentado.
+    await archiveCoexPayload(c.env, payload, body.value)
 
     const events: MetaWebhookEvent[] = []
     let invalidRecognizedEvent = false
@@ -464,6 +746,18 @@ export const webhookRoutes = new Hono<{ Bindings: Env }>()
                 else invalidRecognizedEvent = true
               }
             }
+            // Coexistência: mídia de histórico enviada pela própria empresa chega
+            // com `from` = número da empresa. Não é inbound; só completa o
+            // media_placeholder já gravado com o mesmo id.
+            const businessPhone = digitsOnly(metadata?.display_phone_number)
+            if (businessPhone && item.from === businessPhone && item.from_user_id === undefined) {
+              const coex = extractCoexMessage(value, item)
+              if (coex) events.push({
+                kind: 'coex_message', wabaId, phoneNumberId,
+                source: 'history', direction: 'outbound', message: coex,
+              })
+              continue
+            }
             // Mensagens de erro podem não ter o envelope comum de mensagem recebida.
             if (typeof item.from === 'string' || typeof item.from_user_id === 'string') {
               const inbound = extractInboundMessage(value, item)
@@ -473,6 +767,18 @@ export const webhookRoutes = new Hono<{ Bindings: Env }>()
               else invalidRecognizedEvent = true
             }
           }
+        } else if (['history', 'smb_message_echoes', 'smb_app_state_sync'].includes(field)) {
+          const metadata = value.metadata && typeof value.metadata === 'object'
+            ? value.metadata as Record<string, unknown> : null
+          const phoneNumberId = typeof metadata?.phone_number_id === 'string'
+            ? metadata.phone_number_id : ''
+          if (!phoneNumberId) { invalidRecognizedEvent = true; continue }
+          if (c.env.ENVIRONMENT === 'production' && c.env.META_EXPECTED_PHONE_ID
+            && phoneNumberId !== c.env.META_EXPECTED_PHONE_ID) {
+            invalidRecognizedEvent = true
+            continue
+          }
+          events.push(...parseCoexChange(field, value, wabaId, phoneNumberId, entryTimestamp))
         } else if (field === 'user_preferences') {
           const metadata = value.metadata && typeof value.metadata === 'object'
             ? value.metadata as Record<string, unknown> : null
@@ -587,12 +893,13 @@ export const webhookRoutes = new Hono<{ Bindings: Env }>()
     }
 
     // Não confirma silenciosamente evento reconhecido e malformado: a Meta repetirá.
-    if (events.length > MAX_EVENTS_PER_REQUEST)
+    const coexCount = events.filter((event) => event.kind.startsWith('coex_')).length
+    if (events.length - coexCount > MAX_EVENTS_PER_REQUEST
+      || coexCount > MAX_COEX_EVENTS_PER_REQUEST)
       return c.json({ error: 'lote Meta excede o limite permitido' }, 400)
     if (invalidRecognizedEvent) return c.json({ error: 'evento Meta inválido' }, 400)
-    for (let i = 0; i < events.length; i += 100) {
-      await c.env.WEBHOOK_QUEUE.sendBatch(
-        events.slice(i, i + 100).map((event) => ({ body: event })))
+    for (const batch of queueBatches(events)) {
+      await c.env.WEBHOOK_QUEUE.sendBatch(batch.map((event) => ({ body: event })))
     }
     return c.json({ ok: true })
   })
