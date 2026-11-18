@@ -80,7 +80,12 @@ export async function probeMeta(creds: Credentials): Promise<MetaProbe> {
     // EXPIRED pode aparecer no código temporário de SMS/voz mesmo com o número
     // ainda CONNECTED/LIVE; não é prova suficiente de desconexão. Bloqueamos
     // somente estados que afirmam ausência de verificação.
-    if (['UNVERIFIED', 'NOT_VERIFIED'].includes(health.codeVerificationStatus ?? '')) {
+    // Número em coexistência (is_on_biz_app) nunca passa por OTP da Cloud API:
+    // a Meta devolve NOT_VERIFIED mesmo com ele CONNECTED/LIVE e enviando.
+    if (
+      health.isOnBizApp !== true &&
+      ['UNVERIFIED', 'NOT_VERIFIED'].includes(health.codeVerificationStatus ?? '')
+    ) {
       return completedProbe(health, 'Número Meta não está verificado.')
     }
     if (!health.webhookSubscribed) {

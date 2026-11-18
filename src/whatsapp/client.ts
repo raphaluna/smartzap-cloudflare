@@ -72,6 +72,8 @@ export type MetaOperationalHealth = {
   accountMode: string | null;
   qualityRating: string | null;
   codeVerificationStatus: string | null;
+  /** true = número em coexistência (app WhatsApp Business + Cloud API). */
+  isOnBizApp: boolean | null;
   messagingLimit: string | number | null;
   throughputLevel: MetaThroughputLevel;
   throughputMps: number | null;
@@ -629,7 +631,7 @@ export function whatsappClient(creds: {
       if (!wabaId) throw new MetaApiRequestError("WABA ID ausente", 0, 400);
       if (!creds.appId || !creds.appSecret)
         throw new MetaApiRequestError("App ID ou App Secret ausente", 0, 400);
-      const phoneUrl = `${graph}/${creds.phoneId}?fields=id,status,platform_type,account_mode,quality_rating,throughput,code_verification_status,whatsapp_business_manager_messaging_limit,webhook_configuration`;
+      const phoneUrl = `${graph}/${creds.phoneId}?fields=id,status,platform_type,account_mode,quality_rating,throughput,code_verification_status,is_on_biz_app,whatsapp_business_manager_messaging_limit,webhook_configuration`;
       const wabaUrl = `${graph}/${wabaId}?fields=id`;
       const wabaPhonesUrl = `${graph}/${wabaId}/phone_numbers?limit=100&fields=id`;
       const subscriptionsUrl = `${graph}/${wabaId}/subscribed_apps`;
@@ -804,6 +806,8 @@ export function whatsappClient(creds: {
           typeof phone.code_verification_status === "string"
             ? phone.code_verification_status
             : null,
+        isOnBizApp:
+          typeof phone.is_on_biz_app === "boolean" ? phone.is_on_biz_app : null,
         messagingLimit:
           typeof phone.whatsapp_business_manager_messaging_limit === "string" ||
           typeof phone.whatsapp_business_manager_messaging_limit === "number"
