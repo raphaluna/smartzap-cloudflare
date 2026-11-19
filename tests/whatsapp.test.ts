@@ -434,6 +434,7 @@ describe("whatsappClient.fetchTemplates/checkOperational", () => {
       accountMode: "LIVE",
       qualityRating: "GREEN",
       codeVerificationStatus: "VERIFIED",
+      isOnBizApp: null,
       messagingLimit: "TIER_2K",
       throughputLevel: "UNKNOWN",
       throughputMps: null,
@@ -611,6 +612,166 @@ describe("whatsappClient.fetchTemplates/checkOperational", () => {
         graphVersion: "v25.0",
       }),
     ).resolves.toMatchObject({ ok: true });
+  });
+
+  it("aceita NOT_VERIFIED em número de coexistência (is_on_biz_app)", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        if (url.includes("/debug_token"))
+          return new Response(
+            JSON.stringify({
+              data: {
+                app_id: "app-1",
+                type: "SYSTEM_USER",
+                is_valid: true,
+                scopes: [
+                  "whatsapp_business_management",
+                  "whatsapp_business_messaging",
+                ],
+              },
+            }),
+            { status: 200 },
+          );
+        if (url.includes("/app-1/subscriptions"))
+          return new Response(
+            JSON.stringify({
+              data: [
+                {
+                  object: "whatsapp_business_account",
+                  active: true,
+                  fields: [{ name: "messages" }],
+                },
+              ],
+            }),
+            { status: 200 },
+          );
+        if (url.includes("subscribed_apps"))
+          return new Response(
+            JSON.stringify({
+              data: [
+                {
+                  whatsapp_business_api_data: { id: "app-1" },
+                  override_callback_uri: "https://worker.example/webhook",
+                },
+              ],
+            }),
+            { status: 200 },
+          );
+        if (url.includes("/222/phone_numbers"))
+          return new Response(JSON.stringify({ data: [{ id: "111" }] }), {
+            status: 200,
+          });
+        if (url.includes("/111?"))
+          return new Response(
+            JSON.stringify({
+              id: "111",
+              status: "CONNECTED",
+              platform_type: "CLOUD_API",
+              account_mode: "LIVE",
+              quality_rating: "GREEN",
+              code_verification_status: "NOT_VERIFIED",
+              is_on_biz_app: true,
+              webhook_configuration: {
+                whatsapp_business_account: "https://worker.example/webhook",
+              },
+            }),
+            { status: 200 },
+          );
+        return new Response(JSON.stringify({ id: "222" }), { status: 200 });
+      }),
+    );
+    await expect(
+      probeMeta({
+        token: "t",
+        phoneId: "111",
+        wabaId: "222",
+        appId: "app-1",
+        appSecret: "secret",
+        callbackUrl: "https://worker.example/webhook",
+        graphVersion: "v25.0",
+      }),
+    ).resolves.toMatchObject({ ok: true });
+  });
+
+  it("continua bloqueando NOT_VERIFIED fora da coexistência", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        if (url.includes("/debug_token"))
+          return new Response(
+            JSON.stringify({
+              data: {
+                app_id: "app-1",
+                type: "SYSTEM_USER",
+                is_valid: true,
+                scopes: [
+                  "whatsapp_business_management",
+                  "whatsapp_business_messaging",
+                ],
+              },
+            }),
+            { status: 200 },
+          );
+        if (url.includes("/app-1/subscriptions"))
+          return new Response(
+            JSON.stringify({
+              data: [
+                {
+                  object: "whatsapp_business_account",
+                  active: true,
+                  fields: [{ name: "messages" }],
+                },
+              ],
+            }),
+            { status: 200 },
+          );
+        if (url.includes("subscribed_apps"))
+          return new Response(
+            JSON.stringify({
+              data: [
+                {
+                  whatsapp_business_api_data: { id: "app-1" },
+                  override_callback_uri: "https://worker.example/webhook",
+                },
+              ],
+            }),
+            { status: 200 },
+          );
+        if (url.includes("/222/phone_numbers"))
+          return new Response(JSON.stringify({ data: [{ id: "111" }] }), {
+            status: 200,
+          });
+        if (url.includes("/111?"))
+          return new Response(
+            JSON.stringify({
+              id: "111",
+              status: "CONNECTED",
+              platform_type: "CLOUD_API",
+              account_mode: "LIVE",
+              quality_rating: "GREEN",
+              code_verification_status: "NOT_VERIFIED",
+              is_on_biz_app: false,
+              webhook_configuration: {
+                whatsapp_business_account: "https://worker.example/webhook",
+              },
+            }),
+            { status: 200 },
+          );
+        return new Response(JSON.stringify({ id: "222" }), { status: 200 });
+      }),
+    );
+    await expect(
+      probeMeta({
+        token: "t",
+        phoneId: "111",
+        wabaId: "222",
+        appId: "app-1",
+        appSecret: "secret",
+        callbackUrl: "https://worker.example/webhook",
+        graphVersion: "v25.0",
+      }),
+    ).resolves.toMatchObject({ ok: false, error: "Número Meta não está verificado." });
   });
 
   it("bloqueia token emitido para outro app", async () => {
